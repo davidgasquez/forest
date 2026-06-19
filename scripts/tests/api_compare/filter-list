@@ -3,5 +3,3 @@
 
 !Filecoin.StateGetNetworkParams
 !Filecoin.EthEstimateGas
-!Filecoin.EthGetBlockByHash
-!Filecoin.EthGetBlockByNumber
