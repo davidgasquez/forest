@@ -440,6 +440,18 @@ impl State {
         delegate_state!(self.allocated_sectors)
     }
 
+    pub fn pre_committed_sectors(&self) -> Cid {
+        delegate_state!(self.pre_committed_sectors)
+    }
+
+    pub fn sectors(&self) -> Cid {
+        delegate_state!(self.sectors)
+    }
+
+    pub fn deadlines(&self) -> Cid {
+        delegate_state!(self.deadlines)
+    }
+
     /// Loads the allocated sector numbers
     pub fn load_allocated_sector_numbers<BS: Blockstore>(
         &self,

@@ -6,6 +6,7 @@ pub(crate) mod archive_cmd;
 mod backup_cmd;
 mod benchmark_cmd;
 mod car_cmd;
+mod dataset_cmd;
 mod db_cmd;
 mod fetch_params_cmd;
 mod index_cmd;
@@ -60,6 +61,10 @@ pub enum Subcommand {
     /// Database management
     #[command(subcommand)]
     DB(db_cmd::DBCommands),
+
+    /// Export chain datasets
+    #[command(subcommand)]
+    Dataset(dataset_cmd::DatasetCommands),
 
     /// Index database management
     #[command(subcommand)]
