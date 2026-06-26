@@ -31,10 +31,7 @@ use crate::{
     message::ChainMessage,
     networks::{ChainConfig, NetworkChain},
     prelude::ShallowClone as _,
-    rpc::{
-        state::ApiInvocResult,
-        types::{Event, SectorPreCommitOnChainInfo},
-    },
+    rpc::types::{Event, SectorPreCommitOnChainInfo},
     shim::{
         actors::{MinerActorStateLoad as _, is_miner_actor, miner, reward},
         address::Address,
@@ -415,7 +412,7 @@ impl ExportCommand {
                     }
                 }
 
-                let execution_traces = if self.include_traces || self.include_sector_events {
+                let execution_traces = if self.include_traces {
                     Some(state_manager.execution_trace(&tipset).await?.1)
                 } else {
                     None
@@ -438,9 +435,7 @@ impl ExportCommand {
                         &state_manager,
                         &tipset,
                         &executed,
-                        execution_traces
-                            .as_deref()
-                            .context("execution traces were not loaded")?,
+                        execution_traces.as_deref(),
                         &mut writers,
                         &mut counts,
                     )
@@ -658,7 +653,7 @@ fn export_event(
 fn export_traces<'a>(
     tipset: &Tipset,
     executed: &ExecutedTipset,
-    traces: impl Iterator<Item = &'a Arc<ApiInvocResult>>,
+    traces: impl Iterator<Item = &'a Arc<crate::rpc::state::ApiInvocResult>>,
     writers: &mut Writers,
     counts: &mut ExportCounts,
 ) -> anyhow::Result<()> {
@@ -686,7 +681,7 @@ fn export_sector_events(
     state_manager: &StateManager,
     tipset: &Tipset,
     executed: &ExecutedTipset,
-    traces: &[Arc<ApiInvocResult>],
+    traces: Option<&[Arc<crate::rpc::state::ApiInvocResult>]>,
     writers: &mut Writers,
     counts: &mut ExportCounts,
 ) -> anyhow::Result<()> {
@@ -694,6 +689,7 @@ fn export_sector_events(
         state_manager,
         tipset.parent_state(),
         &executed.state_root,
+        executed,
         traces,
     )?;
     for changed_miner in changed_miners {
@@ -735,34 +731,52 @@ fn changed_miner_actors(
     state_manager: &StateManager,
     pre_root: &cid::Cid,
     post_root: &cid::Cid,
-    traces: &[Arc<ApiInvocResult>],
+    executed: &ExecutedTipset,
+    traces: Option<&[Arc<crate::rpc::state::ApiInvocResult>]>,
 ) -> anyhow::Result<Vec<ChangedMinerActor>> {
     let pre_tree = state_manager.get_state_tree(pre_root)?;
     let post_tree = state_manager.get_state_tree(post_root)?;
+
     let mut candidates = BTreeMap::new();
-    for trace in traces {
-        if let Some(execution_trace) = &trace.execution_trace {
-            collect_trace_recipients(execution_trace, &mut candidates);
+    if let Some(traces) = traces {
+        for trace in traces {
+            if let Some(execution_trace) = &trace.execution_trace {
+                collect_trace_recipients(execution_trace, &mut candidates);
+            }
+        }
+    } else {
+        for executed_message in executed.executed_messages.iter() {
+            let address = executed_message.message.message().to;
+            candidates.insert(address.to_string(), address);
+            for event in executed_message
+                .events
+                .iter()
+                .flat_map(|events| events.iter())
+            {
+                let address = Address::new_id(event.emitter());
+                candidates.insert(address.to_string(), address);
+            }
         }
     }
+
     let mut changed = Vec::new();
     for address in candidates.into_values() {
         let Some(post_actor) = post_tree.get_actor(&address)? else {
             continue;
         };
-        if !is_miner_actor(&post_actor.code) {
-            continue;
+        if is_miner_actor(&post_actor.code) {
+            let pre_actor = pre_tree.get_actor(&address)?;
+            if pre_actor.as_ref() == Some(&post_actor) {
+                continue;
+            };
+            changed.push(ChangedMinerActor {
+                address,
+                pre_actor,
+                post_actor,
+            });
         }
-        let pre_actor = pre_tree.get_actor(&address)?;
-        if pre_actor.as_ref() == Some(&post_actor) {
-            continue;
-        }
-        changed.push(ChangedMinerActor {
-            address,
-            pre_actor,
-            post_actor,
-        });
     }
+
     Ok(changed)
 }
 
@@ -788,99 +802,115 @@ fn export_miner_sector_events(
 ) -> anyhow::Result<()> {
     let store = state_manager.db();
     let policy = &state_manager.chain_config().policy;
+    let deadlines_changed = pre_state.map(miner::State::deadlines) != Some(post_state.deadlines());
+    let allocated_changed =
+        pre_state.map(miner::State::allocated_sectors) != Some(post_state.allocated_sectors());
+    let precommits_changed = pre_state.map(miner::State::pre_committed_sectors)
+        != Some(post_state.pre_committed_sectors());
+    let sectors_changed = pre_state.map(miner::State::sectors) != Some(post_state.sectors());
+    if !deadlines_changed && !allocated_changed && !precommits_changed && !sectors_changed {
+        return Ok(());
+    }
+
     let sector_size = post_state
         .info(store)
         .ok()
         .map(|info| info.sector_size() as u64);
-    let pre_sector_sets = pre_state
-        .map(|state| load_sector_sets(state, policy, store))
-        .transpose()?
-        .unwrap_or_default();
-    let post_sector_sets = load_sector_sets(post_state, policy, store)?;
+    let pre_precommits = if precommits_changed {
+        Some(
+            pre_state
+                .map(|state| load_precommit_map(store, state))
+                .transpose()?
+                .unwrap_or_default(),
+        )
+    } else {
+        None
+    };
+    let post_precommits = if precommits_changed {
+        Some(load_precommit_map(store, post_state)?)
+    } else {
+        None
+    };
+    let pre_sectors = if sectors_changed {
+        Some(
+            pre_state
+                .map(|state| load_sector_map(store, state))
+                .transpose()?
+                .unwrap_or_default(),
+        )
+    } else {
+        None
+    };
+    let post_sectors = if sectors_changed {
+        Some(load_sector_map(store, post_state)?)
+    } else {
+        None
+    };
+    let context = SectorEventContext {
+        state_manager,
+        tipset,
+        executed,
+        changed_miner,
+        pre_state,
+        post_state,
+        sector_size,
+        pre_sectors: pre_sectors.as_ref(),
+        post_sectors: post_sectors.as_ref(),
+        pre_precommits: pre_precommits.as_ref(),
+        post_precommits: post_precommits.as_ref(),
+    };
 
-    emit_bitfield_events(
-        &pre_sector_sets.live,
-        &post_sector_sets.live,
-        "sector_activated",
-        "exact",
-        &SectorEventContext {
-            state_manager,
-            tipset,
-            executed,
-            changed_miner,
-            pre_state,
-            post_state,
-            sector_size,
-        },
-        writers,
-        counts,
-    )?;
-    emit_bitfield_events(
-        &pre_sector_sets.faulty,
-        &post_sector_sets.faulty,
-        "sector_faulted",
-        "exact",
-        &SectorEventContext {
-            state_manager,
-            tipset,
-            executed,
-            changed_miner,
-            pre_state,
-            post_state,
-            sector_size,
-        },
-        writers,
-        counts,
-    )?;
-    emit_bitfield_events(
-        &pre_sector_sets.recovering,
-        &post_sector_sets.recovering,
-        "sector_recovering",
-        "exact",
-        &SectorEventContext {
-            state_manager,
-            tipset,
-            executed,
-            changed_miner,
-            pre_state,
-            post_state,
-            sector_size,
-        },
-        writers,
-        counts,
-    )?;
-    emit_recovered_events(
-        &pre_sector_sets.faulty,
-        &post_sector_sets.active,
-        &SectorEventContext {
-            state_manager,
-            tipset,
-            executed,
-            changed_miner,
-            pre_state,
-            post_state,
-            sector_size,
-        },
-        writers,
-        counts,
-    )?;
-    emit_removed_live_events(
-        &pre_sector_sets.live,
-        &post_sector_sets.live,
-        &SectorEventContext {
-            state_manager,
-            tipset,
-            executed,
-            changed_miner,
-            pre_state,
-            post_state,
-            sector_size,
-        },
-        writers,
-        counts,
-    )?;
+    if deadlines_changed {
+        let pre_sector_sets = pre_state
+            .map(|state| load_sector_sets(state, policy, store))
+            .transpose()?
+            .unwrap_or_default();
+        let post_sector_sets = load_sector_sets(post_state, policy, store)?;
 
-    if pre_state.map(miner::State::allocated_sectors) != Some(post_state.allocated_sectors()) {
+        emit_bitfield_events(
+            &pre_sector_sets.live,
+            &post_sector_sets.live,
+            "sector_activated",
+            "exact",
+            &context,
+            writers,
+            counts,
+        )?;
+        emit_bitfield_events(
+            &pre_sector_sets.faulty,
+            &post_sector_sets.faulty,
+            "sector_faulted",
+            "exact",
+            &context,
+            writers,
+            counts,
+        )?;
+        emit_bitfield_events(
+            &pre_sector_sets.recovering,
+            &post_sector_sets.recovering,
+            "sector_recovering",
+            "exact",
+            &context,
+            writers,
+            counts,
+        )?;
+        emit_recovered_events(
+            &pre_sector_sets.faulty,
+            &post_sector_sets.active,
+            &context,
+            writers,
+            counts,
+        )?;
+        emit_removed_live_events(
+            &pre_sector_sets.live,
+            &post_sector_sets.live,
+            &context,
+            writers,
+            counts,
+        )?;
+    }
+
+    if allocated_changed {
         let pre_allocated = pre_state
             .map(|state| state.load_allocated_sector_numbers(store))
             .transpose()?
@@ -891,65 +921,37 @@ fn export_miner_sector_events(
             &post_allocated,
             "sector_allocated",
             "exact",
-            &SectorEventContext {
-                state_manager,
-                tipset,
-                executed,
-                changed_miner,
-                pre_state,
-                post_state,
-                sector_size,
-            },
+            &context,
             writers,
             counts,
         )?;
     }
 
-    if pre_state.map(miner::State::pre_committed_sectors)
-        != Some(post_state.pre_committed_sectors())
-    {
-        let pre_precommits = pre_state
-            .map(|state| load_precommit_map(store, state))
-            .transpose()?
-            .unwrap_or_default();
-        let post_precommits = load_precommit_map(store, post_state)?;
+    if precommits_changed {
         emit_map_key_events(
-            &pre_precommits,
-            &post_precommits,
+            pre_precommits
+                .as_ref()
+                .context("previous precommit map was not loaded")?,
+            post_precommits
+                .as_ref()
+                .context("current precommit map was not loaded")?,
             "precommit_added",
             "precommit_removed",
-            &SectorEventContext {
-                state_manager,
-                tipset,
-                executed,
-                changed_miner,
-                pre_state,
-                post_state,
-                sector_size,
-            },
+            &context,
             writers,
             counts,
         )?;
     }
 
-    if pre_state.map(miner::State::sectors) != Some(post_state.sectors()) {
-        let pre_sectors = pre_state
-            .map(|state| load_sector_map(store, state))
-            .transpose()?
-            .unwrap_or_default();
-        let post_sectors = load_sector_map(store, post_state)?;
+    if sectors_changed {
         emit_sector_info_events(
-            &pre_sectors,
-            &post_sectors,
-            &SectorEventContext {
-                state_manager,
-                tipset,
-                executed,
-                changed_miner,
-                pre_state,
-                post_state,
-                sector_size,
-            },
+            pre_sectors
+                .as_ref()
+                .context("previous sector map was not loaded")?,
+            post_sectors
+                .as_ref()
+                .context("current sector map was not loaded")?,
+            &context,
             writers,
             counts,
         )?;
@@ -1000,6 +1002,10 @@ struct SectorEventContext<'a> {
     pre_state: Option<&'a miner::State>,
     post_state: &'a miner::State,
     sector_size: Option<u64>,
+    pre_sectors: Option<&'a BTreeMap<u64, miner::SectorOnChainInfo>>,
+    post_sectors: Option<&'a BTreeMap<u64, miner::SectorOnChainInfo>>,
+    pre_precommits: Option<&'a BTreeMap<u64, SectorPreCommitOnChainInfo>>,
+    post_precommits: Option<&'a BTreeMap<u64, SectorPreCommitOnChainInfo>>,
 }
 
 fn emit_bitfield_events(
@@ -1056,15 +1062,10 @@ fn emit_removed_live_events(
     counts: &mut ExportCounts,
 ) -> anyhow::Result<()> {
     let removed = previous_live - current_live;
-    let pre_sectors = context
-        .pre_state
-        .map(|state| load_sector_map(context.state_manager.db(), state))
-        .transpose()?
-        .unwrap_or_default();
     for sector_number in bitfield_numbers(&removed) {
-        let previous_sector = pre_sectors.get(&sector_number);
-        let (event_kind, confidence) = if previous_sector
-            .map(|sector| sector.expiration <= context.tipset.epoch())
+        let previous_expiration = sector_expiration_before(context, sector_number)?;
+        let (event_kind, confidence) = if previous_expiration
+            .map(|expiration| expiration <= context.tipset.epoch())
             .unwrap_or(false)
         {
             ("sector_expired", "classified")
@@ -1079,7 +1080,7 @@ fn emit_removed_live_events(
             serde_json::json!({
                 "previous_live": true,
                 "current_live": false,
-                "previous_expiration": previous_sector.map(|sector| sector.expiration),
+                "previous_expiration": previous_expiration,
             }),
             writers,
             counts,
@@ -1194,23 +1195,12 @@ fn write_sector_event(
     writers: &mut Writers,
     counts: &mut ExportCounts,
 ) -> anyhow::Result<()> {
-    let store = context.state_manager.db();
-    let sector_filter = BitField::try_from_bits([sector_number])?;
-    let sector_info_before = match context.pre_state {
-        Some(state) => try_load_one_sector_info(store, state, &sector_filter),
-        None => None,
-    }
-    .map(serde_json::to_value)
-    .transpose()?;
-    let sector_info_after = try_load_one_sector_info(store, context.post_state, &sector_filter)
-        .map(serde_json::to_value)
-        .transpose()?;
-    let precommit_info_before = context
-        .pre_state
-        .and_then(|state| try_load_precommit_info(store, state, sector_number))
+    let sector_info_before = sector_info_before_json(context, sector_number)?;
+    let sector_info_after = sector_info_after_json(context, sector_number)?;
+    let precommit_info_before = precommit_info_before(context, sector_number)
         .map(|precommit| precommit.into_lotus_json_value())
         .transpose()?;
-    let precommit_info_after = try_load_precommit_info(store, context.post_state, sector_number)
+    let precommit_info_after = precommit_info_after(context, sector_number)
         .map(|precommit| precommit.into_lotus_json_value())
         .transpose()?;
 
@@ -1248,6 +1238,90 @@ fn write_sector_event(
     )?;
     counts.sector_events += 1;
     Ok(())
+}
+
+fn sector_expiration_before(
+    context: &SectorEventContext<'_>,
+    sector_number: u64,
+) -> anyhow::Result<Option<ChainEpoch>> {
+    let Some(state) = context.pre_state else {
+        return Ok(None);
+    };
+    if let Some(sectors) = context.pre_sectors {
+        return Ok(sectors.get(&sector_number).map(|sector| sector.expiration));
+    }
+    let sector_filter = BitField::try_from_bits([sector_number])?;
+    Ok(
+        try_load_one_sector_info(context.state_manager.db(), state, &sector_filter)
+            .map(|sector| sector.expiration),
+    )
+}
+
+fn sector_info_before_json(
+    context: &SectorEventContext<'_>,
+    sector_number: u64,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let Some(state) = context.pre_state else {
+        return Ok(None);
+    };
+    if let Some(sectors) = context.pre_sectors {
+        return Ok(sectors
+            .get(&sector_number)
+            .map(serde_json::to_value)
+            .transpose()?);
+    }
+    let sector_filter = BitField::try_from_bits([sector_number])?;
+    Ok(
+        try_load_one_sector_info(context.state_manager.db(), state, &sector_filter)
+            .map(serde_json::to_value)
+            .transpose()?,
+    )
+}
+
+fn sector_info_after_json(
+    context: &SectorEventContext<'_>,
+    sector_number: u64,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    if let Some(sectors) = context.post_sectors {
+        return Ok(sectors
+            .get(&sector_number)
+            .map(serde_json::to_value)
+            .transpose()?);
+    }
+    let sector_filter = BitField::try_from_bits([sector_number])?;
+    Ok(try_load_one_sector_info(
+        context.state_manager.db(),
+        context.post_state,
+        &sector_filter,
+    )
+    .map(serde_json::to_value)
+    .transpose()?)
+}
+
+fn precommit_info_before(
+    context: &SectorEventContext<'_>,
+    sector_number: u64,
+) -> Option<SectorPreCommitOnChainInfo> {
+    if let Some(precommits) = context.pre_precommits {
+        return precommits.get(&sector_number).cloned();
+    }
+    context
+        .pre_state
+        .and_then(|state| try_load_precommit_info(context.state_manager.db(), state, sector_number))
+}
+
+fn precommit_info_after(
+    context: &SectorEventContext<'_>,
+    sector_number: u64,
+) -> Option<SectorPreCommitOnChainInfo> {
+    if let Some(precommits) = context.post_precommits {
+        return precommits.get(&sector_number).cloned();
+    }
+    try_load_precommit_info(
+        context.state_manager.db(),
+        context.post_state,
+        sector_number,
+    )
 }
 
 fn load_one_sector_info(
