@@ -85,7 +85,7 @@ pub struct ExportCommand {
     /// Directory where JSONL files and manifest.json are written.
     #[arg(short, long)]
     out: PathBuf,
-    /// Export only tipsets and block headers. With `--include-sector-events`, also export sector events without VM execution.
+    /// Export only tipsets and block headers. Use this for snapshots without historical messages/state.
     #[arg(long)]
     skip_execution: bool,
     /// Export VM execution traces. Implies execution and can be significantly slower.
@@ -373,37 +373,7 @@ impl ExportCommand {
         {
             export_tipset(&tipset, &mut writers, &mut counts)?;
 
-            if self.skip_execution {
-                if self.include_sector_events {
-                    let child_tipset = chain_store
-                        .load_child_tipset(&tipset)?
-                        .with_context(|| format!("loading child tipset for {}", tipset.key()))?;
-                    let (post_root, candidates) = if child_tipset.epoch() == tipset.epoch() + 1 {
-                        let messages = chain_store.messages_for_tipset(&tipset)?;
-                        (
-                            *child_tipset.parent_state(),
-                            message_sector_event_candidates(messages.iter()),
-                        )
-                    } else {
-                        let executed = state_manager.load_executed_tipset(&tipset).await?;
-                        (
-                            executed.state_root,
-                            executed_sector_event_candidates(&executed),
-                        )
-                    };
-                    export_sector_events(
-                        &state_manager,
-                        &tipset,
-                        &post_root,
-                        candidates,
-                        &mut writers,
-                        &mut counts,
-                    )
-                    .with_context(|| {
-                        format!("exporting sector events for epoch {}", tipset.epoch())
-                    })?;
-                }
-            } else {
+            if !self.skip_execution {
                 let executed = state_manager.load_executed_tipset(&tipset).await?;
                 for (message_index, executed_message) in
                     executed.executed_messages.iter().enumerate()
@@ -464,8 +434,8 @@ impl ExportCommand {
                     export_sector_events(
                         &state_manager,
                         &tipset,
-                        &executed.state_root,
-                        sector_event_candidates(&executed, execution_traces.as_deref()),
+                        &executed,
+                        execution_traces.as_deref(),
                         &mut writers,
                         &mut counts,
                     )
@@ -710,13 +680,18 @@ fn export_traces<'a>(
 fn export_sector_events(
     state_manager: &StateManager,
     tipset: &Tipset,
-    post_root: &cid::Cid,
-    candidates: BTreeMap<String, Address>,
+    executed: &ExecutedTipset,
+    traces: Option<&[Arc<crate::rpc::state::ApiInvocResult>]>,
     writers: &mut Writers,
     counts: &mut ExportCounts,
 ) -> anyhow::Result<()> {
-    let changed_miners =
-        changed_miner_actors(state_manager, tipset.parent_state(), post_root, candidates)?;
+    let changed_miners = changed_miner_actors(
+        state_manager,
+        tipset.parent_state(),
+        &executed.state_root,
+        executed,
+        traces,
+    )?;
     for changed_miner in changed_miners {
         let post_state = miner::State::load(
             state_manager.db(),
@@ -735,7 +710,7 @@ fn export_sector_events(
         export_miner_sector_events(
             state_manager,
             tipset,
-            post_root,
+            executed,
             &changed_miner,
             pre_state.as_ref(),
             &post_state,
@@ -756,10 +731,34 @@ fn changed_miner_actors(
     state_manager: &StateManager,
     pre_root: &cid::Cid,
     post_root: &cid::Cid,
-    candidates: BTreeMap<String, Address>,
+    executed: &ExecutedTipset,
+    traces: Option<&[Arc<crate::rpc::state::ApiInvocResult>]>,
 ) -> anyhow::Result<Vec<ChangedMinerActor>> {
     let pre_tree = state_manager.get_state_tree(pre_root)?;
     let post_tree = state_manager.get_state_tree(post_root)?;
+
+    let mut candidates = BTreeMap::new();
+    if let Some(traces) = traces {
+        for trace in traces {
+            if let Some(execution_trace) = &trace.execution_trace {
+                collect_trace_recipients(execution_trace, &mut candidates);
+            }
+        }
+    } else {
+        for executed_message in executed.executed_messages.iter() {
+            let address = executed_message.message.message().to;
+            candidates.insert(address.to_string(), address);
+            for event in executed_message
+                .events
+                .iter()
+                .flat_map(|events| events.iter())
+            {
+                let address = Address::new_id(event.emitter());
+                candidates.insert(address.to_string(), address);
+            }
+        }
+    }
+
     let mut changed = Vec::new();
     for address in candidates.into_values() {
         let Some(post_actor) = post_tree.get_actor(&address)? else {
@@ -781,54 +780,6 @@ fn changed_miner_actors(
     Ok(changed)
 }
 
-fn sector_event_candidates(
-    executed: &ExecutedTipset,
-    traces: Option<&[Arc<crate::rpc::state::ApiInvocResult>]>,
-) -> BTreeMap<String, Address> {
-    if let Some(traces) = traces {
-        let mut candidates = BTreeMap::new();
-        for trace in traces {
-            if let Some(execution_trace) = &trace.execution_trace {
-                collect_trace_recipients(execution_trace, &mut candidates);
-            }
-        }
-        candidates
-    } else {
-        executed_sector_event_candidates(executed)
-    }
-}
-
-fn executed_sector_event_candidates(executed: &ExecutedTipset) -> BTreeMap<String, Address> {
-    let mut candidates = message_sector_event_candidates(
-        executed
-            .executed_messages
-            .iter()
-            .map(|executed_message| &executed_message.message),
-    );
-    for executed_message in executed.executed_messages.iter() {
-        for event in executed_message
-            .events
-            .iter()
-            .flat_map(|events| events.iter())
-        {
-            let address = Address::new_id(event.emitter());
-            candidates.insert(address.to_string(), address);
-        }
-    }
-    candidates
-}
-
-fn message_sector_event_candidates<'a>(
-    messages: impl Iterator<Item = &'a ChainMessage>,
-) -> BTreeMap<String, Address> {
-    let mut candidates = BTreeMap::new();
-    for message in messages {
-        let address = message.message().to;
-        candidates.insert(address.to_string(), address);
-    }
-    candidates
-}
-
 fn collect_trace_recipients(
     trace: &crate::rpc::state::ExecutionTrace,
     recipients: &mut BTreeMap<String, Address>,
@@ -842,7 +793,7 @@ fn collect_trace_recipients(
 fn export_miner_sector_events(
     state_manager: &StateManager,
     tipset: &Tipset,
-    post_root: &cid::Cid,
+    executed: &ExecutedTipset,
     changed_miner: &ChangedMinerActor,
     pre_state: Option<&miner::State>,
     post_state: &miner::State,
@@ -898,7 +849,7 @@ fn export_miner_sector_events(
     let context = SectorEventContext {
         state_manager,
         tipset,
-        post_root,
+        executed,
         changed_miner,
         pre_state,
         post_state,
@@ -1046,7 +997,7 @@ fn load_sector_sets(
 struct SectorEventContext<'a> {
     state_manager: &'a StateManager,
     tipset: &'a Tipset,
-    post_root: &'a cid::Cid,
+    executed: &'a ExecutedTipset,
     changed_miner: &'a ChangedMinerActor,
     pre_state: Option<&'a miner::State>,
     post_state: &'a miner::State,
@@ -1260,7 +1211,7 @@ fn write_sector_event(
             tipset_key: format_tipset_key(context.tipset.key()),
             parent_tipset_key: format_tipset_key(context.tipset.parents()),
             state_root_before: context.tipset.parent_state().to_string(),
-            state_root_after: context.post_root.to_string(),
+            state_root_after: context.executed.state_root.to_string(),
             miner_id: context.changed_miner.address.to_string(),
             sector_number,
             event_kind,
